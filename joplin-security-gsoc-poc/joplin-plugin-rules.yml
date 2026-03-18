@@ -1,0 +1,24 @@
+rules:
+  - id: joplin-no-eval
+    pattern: eval(...)
+    message: "Dangerous eval() usage detected in Joplin plugin. This can execute arbitrary code."
+    severity: ERROR
+    languages: [typescript, javascript]
+
+  - id: joplin-no-external-fetch
+    pattern: fetch(...)
+    message: "External network request detected. Joplin plugins should not make unauthorized network calls."
+    severity: WARNING
+    languages: [typescript, javascript]
+
+  - id: joplin-no-child-process
+    pattern: require('child_process')
+    message: "child_process usage detected. This allows arbitrary command execution on the user's machine."
+    severity: ERROR
+    languages: [typescript, javascript]
+
+  - id: joplin-no-dynamic-require
+    pattern: require($X)
+    message: "Dynamic require() detected. This can be used to load malicious modules at runtime."
+    severity: WARNING
+    languages: [typescript, javascript]
