@@ -10,15 +10,11 @@ console.log("\nBEFORE migration — sample plugin:");
 const firstPlugin = Object.keys(manifests)[0];
 console.log(JSON.stringify(manifests[firstPlugin], null, 2));
 
-// Migration: add _reviewed, _github_repo, _review_date to all plugins
+// Migration: add _reviewed and _review_date to all plugins
 let migratedCount = 0;
 for (const pluginId of Object.keys(manifests)) {
   manifests[pluginId]._reviewed = "unreviewed";
   manifests[pluginId]._review_date = null;
-  if (!manifests[pluginId]._github_repo) {
-    manifests[pluginId]._github_repo =
-      manifests[pluginId].repository_url || null;
-  }
   migratedCount++;
 }
 
