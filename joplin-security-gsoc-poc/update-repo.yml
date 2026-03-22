@@ -1,0 +1,318 @@
+# Proposed replacement for update-repo.yml
+#
+# Current system: single cron job, full write access, no human review
+# This system: PR-based review, job separation, write access only where needed
+#
+# Security improvements over current workflow:
+# - No global write permissions (each job defines its own)
+# - Plugin code only runs in build job (contents: read)
+# - write access only in commit job (never runs plugin code)
+# - CLI dependency pinned to exact version
+# - Triggered by human action, not cron
+
+name: Plugin Review Pipeline
+
+on:
+  # Trigger 1 - fires when someone comments on a PR
+  issue_comment:
+    types: [created]
+
+  # Trigger 2 - fires when a PR is closed (merged or not)
+  pull_request:
+    types: [closed]
+
+# No global permissions - each job defines its own
+permissions: {}
+
+jobs:
+  # -------------------------------------------------------
+  # JOB 1 - SCAN
+  # Runs when plugin author comments "Review Plugin" on PR
+  # Only reads code, never writes to repo
+  # -------------------------------------------------------
+  scan:
+    name: Automated Security Scan
+    runs-on: ubuntu-latest
+
+    # Only run if:
+    # 1. This is a comment event (not a PR merge event)
+    # 2. Comment is exactly "Review Plugin"
+    # 3. Commenter is PR author OR a repo maintainer
+    if: |
+      github.event_name == 'issue_comment' &&
+      contains(github.event.comment.body, 'Review Plugin') &&
+      (
+        github.event.comment.user.login == github.event.issue.user.login ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'OWNER'
+      )
+
+    permissions:
+      contents: read # read plugin source only
+      pull-requests: write # post scan report as PR comment
+
+    steps:
+      - name: Get PR details
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            // Read repo URL and commit hash from PR body
+            const repoUrl = pr.data.body.match(/Repository URL:\s*(.+)/)?.[1]?.trim();
+            const commitHash = pr.data.body.match(/Commit Hash:\s*(.+)/)?.[1]?.trim();
+            core.setOutput('repo_url', repoUrl);
+            core.setOutput('commit_hash', commitHash);
+
+      - name: Clone plugin source at reviewed commit
+        run: |
+          git clone ${{ steps.pr.outputs.repo_url }} plugin-source
+          cd plugin-source
+          git checkout ${{ steps.pr.outputs.commit_hash }}
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install plugin dependencies
+        run: |
+          cd plugin-source
+          npm install --ignore-scripts
+
+      - name: Run Semgrep scan
+        id: semgrep
+        run: |
+          pip install semgrep
+          semgrep --config=p/javascript \
+                  --config=p/nodejs \
+                  --json \
+                  --output=semgrep-results.json \
+                  plugin-source/src/ || true
+          echo "semgrep_findings=$(cat semgrep-results.json | jq '.results | length')" >> $GITHUB_OUTPUT
+
+      - name: Run socket.dev scan
+        id: socketdev
+        run: |
+          npx @socketsecurity/cli@latest scan plugin-source/ \
+              --json > socketdev-results.json || true
+          echo "socket_findings=$(cat socketdev-results.json | jq '.issues | length')" >> $GITHUB_OUTPUT
+
+      - name: Post scan report as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const semgrepFindings = ${{ steps.semgrep.outputs.semgrep_findings }};
+            const socketFindings = ${{ steps.socketdev.outputs.socket_findings }};
+            const repoUrl = '${{ steps.pr.outputs.repo_url }}';
+            const commitHash = '${{ steps.pr.outputs.commit_hash }}';
+
+            const status = (semgrepFindings === 0 && socketFindings === 0)
+              ? '✅ All scans passed'
+              : '❌ Issues found - please review';
+
+            const body = `
+            ## Automated Security Scan Report
+            **Status:** ${status}
+            **Repository:** ${repoUrl}
+            **Commit:** \`${commitHash}\`
+
+            ### Semgrep Results
+            ${semgrepFindings === 0
+              ? '✅ No dangerous patterns detected'
+              : `❌ ${semgrepFindings} dangerous pattern(s) found - see semgrep-results.json`
+            }
+
+            ### socket.dev Results
+            ${socketFindings === 0
+              ? '✅ No dependency issues detected'
+              : `❌ ${socketFindings} dependency issue(s) found - see socketdev-results.json`
+            }
+
+            ---
+            *This report was generated automatically. A human reviewer must approve this PR before the plugin is built and published.*
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body,
+            });
+
+            // Block PR if issues found
+            if (semgrepFindings > 0 || socketFindings > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['scan-failed'],
+              });
+            }
+
+  # -------------------------------------------------------
+  # JOB 2 - BUILD
+  # Runs when a reviewer merges the PR
+  # Runs plugin code but has NO write access to repo
+  # -------------------------------------------------------
+  build:
+    name: Build Plugin From Source
+    runs-on: ubuntu-latest
+
+    # Only run if:
+    # 1. This is a PR event (not a comment event)
+    # 2. PR was actually merged (not just closed)
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true
+
+    permissions:
+      contents: read # READ ONLY - plugin code runs here
+
+    outputs:
+      plugin_id: ${{ steps.build.outputs.plugin_id }}
+
+    steps:
+      - name: Checkout joplin/plugins repo
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          path: plugins
+
+      - name: Get repo URL and commit hash from PR
+        id: pr_info
+        run: |
+          REPO_URL=$(echo "${{ github.event.pull_request.body }}" | grep "Repository URL:" | awk '{print $3}')
+          COMMIT_HASH=$(echo "${{ github.event.pull_request.body }}" | grep "Commit Hash:" | awk '{print $3}')
+          echo "repo_url=$REPO_URL" >> $GITHUB_OUTPUT
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+
+      - name: Clone plugin source at reviewed commit
+        run: |
+          git clone ${{ steps.pr_info.outputs.repo_url }} plugin-source
+          cd plugin-source
+          git checkout ${{ steps.pr_info.outputs.commit_hash }}
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install plugin dependencies
+        run: |
+          cd plugin-source
+          # --ignore-scripts prevents postinstall scripts from running
+          npm install --ignore-scripts
+
+      - name: Build plugin from source
+        id: build
+        run: |
+          cd plugin-source
+          npm run dist
+          # Get plugin ID from manifest
+          PLUGIN_ID=$(cat publish/manifest.json | jq -r '.id')
+          echo "plugin_id=$PLUGIN_ID" >> $GITHUB_OUTPUT
+
+      - name: Run final Semgrep verification
+        run: |
+          pip install semgrep
+          semgrep --config=p/javascript \
+                  --config=p/nodejs \
+                  plugin-source/src/
+
+      - name: Upload .jpl as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-build
+          path: |
+            plugin-source/publish/*.jpl
+            plugin-source/publish/manifest.json
+
+  # -------------------------------------------------------
+  # JOB 3 - COMMIT
+  # Runs after build job succeeds
+  # Has write access but NEVER runs plugin code
+  # -------------------------------------------------------
+  commit:
+    name: Commit Plugin to Repository
+    runs-on: ubuntu-latest
+    needs: build # only runs if build job succeeds
+
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true
+
+    permissions:
+      contents: write # WRITE ACCESS - but never runs plugin code
+
+    steps:
+      - name: Checkout joplin/plugins repo
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          path: plugins
+
+      - name: Prepare git identity
+        run: |
+          git config --global user.name "joplinbot"
+          git config --global user.email "bot@joplinapp.org"
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install plugin-repo-cli (pinned version)
+        run: |
+          mkdir ./plugin-repo-builder/
+          cd ./plugin-repo-builder/
+          # Pinned to exact version - never auto-updates to potentially compromised version
+          npm install @joplin/plugin-repo-cli@3.6.0
+
+      - name: Download .jpl artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-build
+          path: plugin-artifact/
+
+      - name: Update manifests.json with reviewed status
+        run: |
+          PLUGIN_ID=${{ needs.build.outputs.plugin_id }}
+          # Update _reviewed and _review_date fields
+          node -e "
+            const fs = require('fs');
+            const manifests = JSON.parse(fs.readFileSync('plugins/manifests.json'));
+            manifests['$PLUGIN_ID']._reviewed = 'reviewed';
+            manifests['$PLUGIN_ID']._review_date = '$(date -u +%Y-%m-%d)';
+            fs.writeFileSync('plugins/manifests.json', JSON.stringify(manifests, null, '\t'));
+          "
+
+      - name: Copy .jpl to plugins directory
+        run: |
+          PLUGIN_ID=${{ needs.build.outputs.plugin_id }}
+          mkdir -p plugins/plugins/$PLUGIN_ID
+          cp plugin-artifact/*.jpl plugins/plugins/$PLUGIN_ID/plugin.jpl
+          cp plugin-artifact/manifest.json plugins/plugins/$PLUGIN_ID/manifest.json
+
+      - name: Commit and push
+        run: |
+          cd plugins
+          git add -A
+          git commit -m "Add/Update plugin: ${{ needs.build.outputs.plugin_id }}"
+          git push origin master
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: '❌ Build or commit failed after merge. A maintainer needs to investigate and re-trigger manually.',
+            });
